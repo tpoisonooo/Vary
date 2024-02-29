@@ -9,14 +9,16 @@ from vary.model import *
 from vary.utils.utils import KeywordsStoppingCriteria
 
 from PIL import Image
+from aiohttp import web
 
 import os
 import requests
 from PIL import Image
 from io import BytesIO
 from vary.model.plug.blip_process import BlipImageEvalProcessor
-from transformers import TextStreamer
 from vary.model.plug.transforms import train_transform, test_transform
+from transformers import TextStreamer
+from loguru import logger
 
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_IMAGE_PATCH_TOKEN = '<imgpad>'
@@ -32,8 +34,72 @@ def load_image(image_file):
         image = Image.open(image_file).convert('RGB')
     return image
 
+image_processor = None
+image_processor_high = None
+inputs = None
+conv = None
+tokenizer = None
+model = None
+
+async def api(request):
+    global image_processor
+    global image_processor_high
+    global inputs
+    global conv
+    global tokenizer
+    global model
+
+    input_json = await request.json()
+    logger.debug(input_json)
+
+    image_path = input_json['image_path']
+    image = load_image(image_path)
+
+    image_1 = image.copy()
+    image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+
+    image_tensor_1 = image_processor_high(image_1)
+
+    input_ids = torch.as_tensor(inputs.input_ids).cuda()
+
+    # stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+    keywords = [stop_str]
+    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+    # streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    outputs = ''
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output_ids = model.generate(
+            input_ids,
+            images=[(image_tensor.unsqueeze(0).half().cuda(), image_tensor_1.unsqueeze(0).half().cuda())],
+            do_sample=True,
+            num_beams = 1,
+            # temperature=0.2,
+            streamer=None,
+            max_new_tokens=2048,
+            stopping_criteria=[stopping_criteria])
+        
+        # print(output_ids)
+
+        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
+        
+        # conv.messages[-1][-1] = outputs
+        if outputs.endswith(stop_str):
+            outputs = outputs[:-len(stop_str)]
+        outputs = outputs.strip()
+
+        print(outputs)
+    return web.json_response({'content': outputs})
+
 
 def eval_model(args):
+    global image_processor
+    global image_processor_high
+    global inputs
+    global conv
+    global tokenizer
+    global model
     # Model
     disable_torch_init()
     model_name = os.path.expanduser(args.model_name)
@@ -47,8 +113,9 @@ def eval_model(args):
 
 
     # TODO download clip-vit in huggingface
-    image_processor = CLIPImageProcessor.from_pretrained("/cache/vit-large-patch14/", torch_dtype=torch.float16)
-
+    # image_processor = CLIPImageProcessor.from_pretrained("/cache/vit-large-patch14/", torch_dtype=torch.float16)
+    # image_processor = CLIPImageProcessor.from_pretrained("/models/clip-vit-large-patch14", torch_dtype=torch.float16)
+    image_processor = CLIPImageProcessor.from_pretrained("/root/huixiangdou-res/clip-vit-large-patch14", torch_dtype=torch.float16)
     image_processor_high = test_transform
 
     use_im_start_end = True
@@ -62,58 +129,19 @@ def eval_model(args):
     else:
         qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
 
-
-    
-
     conv_mode = "mpt"
     args.conv_mode = conv_mode
 
-    conv = conv_templates[args.conv_mode].copy()
+    conv = conv_templates[conv_mode].copy()
     conv.append_message(conv.roles[0], qs)
     conv.append_message(conv.roles[1], None)
     prompt = conv.get_prompt()
 
-
     inputs = tokenizer([prompt])
 
-
-    image = load_image(args.image_file)
-    image_1 = image.copy()
-    image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-
-    image_tensor_1 = image_processor_high(image_1)
-
-    input_ids = torch.as_tensor(inputs.input_ids).cuda()
-
-    # stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-    stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-    keywords = [stop_str]
-    stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-
-
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        output_ids = model.generate(
-            input_ids,
-            images=[(image_tensor.unsqueeze(0).half().cuda(), image_tensor_1.unsqueeze(0).half().cuda())],
-            do_sample=True,
-            num_beams = 1,
-            # temperature=0.2,
-            streamer=streamer,
-            max_new_tokens=2048,
-            stopping_criteria=[stopping_criteria]
-            )
-        
-        # print(output_ids)
-
-        # outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
-        
-        # # conv.messages[-1][-1] = outputs
-        # if outputs.endswith(stop_str):
-        #     outputs = outputs[:-len(stop_str)]
-        # outputs = outputs.strip()
-
-        # print(outputs)
+    app = web.Application()
+    app.add_routes([web.post('/api', api)])
+    web.run_app(app, host='0.0.0.0', port=9999)
 
 
 
